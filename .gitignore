@@ -1,0 +1,4 @@
+/target
+/.python-version
+/Cargo.lock
+/venv/

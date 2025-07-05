@@ -1,0 +1,7 @@
+database:
+  url: "localhost"
+  user: "db"
+  password: "secret"
+  dbname: "video"
+app_conf:
+  log_level: "ERROR"
