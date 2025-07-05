@@ -9,8 +9,8 @@ use serde_yaml;
 use sqlx::postgres::PgPoolOptions;
 use tokio::task;
 use chrono;
-use log::{info, debug, error};
-use env_logger::Env;
+use tracing::{info, error, debug, Level};
+use tracing_subscriber::FmtSubscriber;
 
 #[derive(Debug, Deserialize)]
 struct DatabaseConfig {
@@ -133,15 +133,33 @@ fn probe_video_dimensions(file_path: &str) -> Result<(u32, u32), String> {
     Ok((w, h))
 }
 
+fn parse_log_level(level: &str) -> Level {
+    match level.to_lowercase().as_str() {
+        "trace" => Level::TRACE,
+        "debug" => Level::DEBUG,
+        "info" => Level::INFO,
+        "warn" => Level::WARN,
+        "error" => Level::ERROR,
+        _ => Level::INFO,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config("./config.yml").await?;
 
-    std::env::set_var("RUST_LOG", &config.app_conf.log_level);
-    env_logger::init_from_env(Env::default().default_filter_or(&config.app_conf.log_level));
-    info!("Configuration loaded successfully: {:?}", config);
+    let log_level = parse_log_level(&config.app_conf.log_level);
 
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(log_level)
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("setting tracing default failed");
+
+    info!("Configuration loaded successfully: {:?}", config);
     debug!("Database URL being used: {:?}", config.database.url);
+    info!("Starting application");
 
     let db_url = format!("postgres://{}:{}@{}/{}",
                          config.database.user,
