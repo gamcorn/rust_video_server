@@ -23,6 +23,8 @@ struct DatabaseConfig {
 #[derive(Debug, Deserialize)]
 struct AppConfig {
     log_level: String,
+    num_threads: usize,
+    max_pg_pool_conn: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let db_pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(config.app_conf.max_pg_pool_conn)
         .connect(&db_url)
         .await?;
 
@@ -253,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting RPC server at http://0.0.0.0:3030");
     let server = ServerBuilder::new(io)
-        .threads(4)
+        .threads(config.app_conf.num_threads)
         .start_http(&"0.0.0.0:3030".parse().unwrap())
         .expect("Unable to start RPC server");
 

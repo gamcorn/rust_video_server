@@ -5,3 +5,5 @@ database:
   dbname: "video"
 app_conf:
   log_level: "ERROR"
+  num_threads: 8
+  max_pg_pool_conn: 15
