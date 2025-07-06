@@ -1,16 +1,19 @@
 use serde::{Deserialize, Serialize};
 use jsonrpc_core::{IoHandler, Params, Error};
 use jsonrpc_http_server::ServerBuilder;
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use tempfile::NamedTempFile;
 use std::io::Write;
-use ffmpeg_next as ffmpeg;
 use serde_yaml;
 use sqlx::postgres::PgPoolOptions;
-use tokio::task;
+use tokio::{task, sync::mpsc};
 use chrono;
 use tracing::{info, error, debug, Level};
 use tracing_subscriber::FmtSubscriber;
+use std::process::Command;
+
+static CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
 #[derive(Debug, Deserialize)]
 struct DatabaseConfig {
@@ -33,8 +36,7 @@ struct Settings {
     app_conf: AppConfig,
 }
 
-
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct VideoRequest {
     file_name: String,
     date: String,
@@ -48,89 +50,70 @@ struct VideoDimensions {
     height: u32,
 }
 
-
 async fn load_config(path: &str) -> Result<Settings, Box<dyn std::error::Error>> {
-    info!("Loading configuration file: {}", path);
+    info!("Loading configuration from {}", path);
     let content = tokio::fs::read_to_string(path).await?;
-    debug!("Config file content loaded");
-    let cfg: Settings = serde_yaml::from_str(&content)?;
-    info!("Config file parsed successfully");
-    Ok(cfg)
+    let config: Settings = serde_yaml::from_str(&content)?;
+    info!("Configuration loaded successfully");
+    Ok(config)
 }
 
 async fn download_video_to_tempfile(url: &str) -> Result<NamedTempFile, String> {
-    info!("Starting download for video from URL {}", url);
-    let response = Client::new()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("HTTP request failed: {}", e);
-            format!("HTTP request error: {}", e)
-        })?;
+    info!("Downloading video from URL: {}", url);
+    let response = CLIENT.get(url).send().await.map_err(|e| {
+        error!("HTTP request failed: {}", e);
+        format!("HTTP request error: {}", e)
+    })?;
 
     if !response.status().is_success() {
-        error!("Download failed with HTTP status code: {}", response.status());
+        error!("Failed to download video: HTTP {}", response.status());
         return Err(format!("Failed to download video: HTTP {}", response.status()));
     }
 
-    let bytes = response.bytes().await
-        .map_err(|e| {
-            error!("Error reading response bytes: {}", e);
-            format!("Failed getting bytes: {}", e)
-        })?;
+    let bytes = response.bytes().await.map_err(|e| {
+        error!("Failed to read response bytes: {}", e);
+        format!("Failed getting bytes: {}", e)
+    })?;
 
     let mut tempfile = NamedTempFile::new().map_err(|e| {
-        error!("Failed creating temp file: {}", e);
+        error!("Failed to create temp file: {}", e);
         format!("Tempfile error: {}", e)
     })?;
 
     tempfile.write_all(&bytes).map_err(|e| {
-        error!("Error writing video content to tempfile: {}", e);
+        error!("Failed writing to temp file: {}", e);
         format!("Failed writing content: {}", e)
     })?;
 
-    info!("Video downloaded successfully to temporary file {:?}", tempfile.path());
+    info!("Video downloaded to temporary file");
     Ok(tempfile)
 }
 
 fn probe_video_dimensions(file_path: &str) -> Result<(u32, u32), String> {
-    info!("Analyzing video file dimensions for file: {}", file_path);
-    ffmpeg::init().map_err(|e| {
-        error!("FFmpeg initialization error: {}", e);
-        format!("FFmpeg init error: {}", e)
-    })?;
+    debug!("Probing video dimensions for file: {}", file_path);
 
-    let ictx = ffmpeg::format::input(&file_path)
-        .map_err(|e| {
-            error!("FFmpeg cannot open input file: {}", e);
-            format!("FFmpeg input error: {}", e)
-        })?;
+    let output = Command::new("mediainfo")
+        .arg("--Inform=Video;%Width%x%Height%")
+        .arg(file_path)
+        .output()
+        .map_err(|e| format!("Failed to execute mediainfo: {}", e))?;
 
-    debug!("Video file opened successfully.");
+    if !output.status.success() {
+        return Err("mediainfo command failed".to_string());
+    }
 
-    let stream = ictx.streams()
-        .best(ffmpeg::media::Type::Video)
-        .ok_or_else(|| {
-            error!("No video stream found in file");
-            "No video stream detected".to_string()
-        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dims: Vec<&str> = stdout.trim().split('x').collect();
 
-    let codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-        .map_err(|e| {
-            error!("Failed to obtain codec context: {}", e);
-            format!("Codec context error: {}", e)
-        })?
-        .decoder()
-        .video()
-        .map_err(|e| {
-            error!("Failed to obtain video decoder context: {}", e);
-            format!("Decoder error: {}", e)
-        })?;
+    if dims.len() != 2 {
+        return Err("Unexpected mediainfo output".to_string());
+    }
 
-    let (w, h) = (codec_ctx.width(), codec_ctx.height());
-    info!("Video dimensions parsed: width={} height={}", w, h);
-    Ok((w, h))
+    let width = dims[0].parse::<u32>().map_err(|_| "Failed to parse width".to_string())?;
+    let height = dims[1].parse::<u32>().map_err(|_| "Failed to parse height".to_string())?;
+
+    debug!("Parsed dimensions: width={}, height={}", width, height);
+    Ok((width, height))
 }
 
 fn parse_log_level(level: &str) -> Level {
@@ -144,129 +127,87 @@ fn parse_log_level(level: &str) -> Level {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config("./config.yml").await?;
-
     let log_level = parse_log_level(&config.app_conf.log_level);
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(log_level)
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting tracing default failed");
-
-    info!("Configuration loaded successfully: {:?}", config);
-    debug!("Database URL being used: {:?}", config.database.url);
-    info!("Starting application");
+    let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
 
     let db_url = format!("postgres://{}:{}@{}/{}",
-                         config.database.user,
-                         config.database.password,
-                         config.database.url,
-                         config.database.dbname
-    );
+                         config.database.user, config.database.password, config.database.url, config.database.dbname);
 
     let db_pool = PgPoolOptions::new()
         .max_connections(config.app_conf.max_pg_pool_conn)
         .connect(&db_url)
         .await?;
 
+    info!("Database connection established");
+
+    let (tx, mut rx) = mpsc::channel::<(VideoRequest, (u32, u32))>(100);
+
+    let db_pool_clone = db_pool.clone();
+    tokio::spawn(async move {
+        while let Some((parsed, dimensions)) = rx.recv().await {
+            let request_date = chrono::DateTime::parse_from_rfc3339(&parsed.date)
+                .map(|dt| dt.naive_utc())
+                .unwrap_or_else(|_| chrono::NaiveDateTime::from_timestamp(0, 0));
+
+            if let Err(e) = sqlx::query!(
+                "INSERT INTO video_requests (identifier, file_name, request_date, width, height) VALUES ($1, $2, $3, $4, $5)",
+                parsed.identifier,
+                parsed.file_name,
+                request_date,
+                dimensions.0 as i32,
+                dimensions.1 as i32
+            ).execute(&db_pool_clone).await {
+                error!("Database insert failed: {:?}", e);
+            } else {
+                debug!("Database insert successful for identifier: {}", parsed.identifier);
+            }
+        }
+    });
+
     let mut io = IoHandler::new();
 
     {
-        let db_pool = db_pool.clone();
+        let tx = tx.clone();
         io.add_method("getVideoDimensions", move |params: Params| {
-            let db_pool = db_pool.clone();
-
+            let tx = tx.clone();
             async move {
                 info!("Received getVideoDimensions request");
-                debug!("Parameters received: {:?}", params);
-
                 let parsed: VideoRequest = params.parse()
                     .map_err(|e| {
-                        error!("Invalid params: {}", e);
+                        error!("Invalid request params: {}", e);
                         Error::invalid_params(format!("Invalid params: {}", e))
                     })?;
-                debug!("Parsed request: {:?}", parsed);
-                debug!("Received date: {}", parsed.date);
 
                 let tempfile = download_video_to_tempfile(&parsed.url).await
                     .map_err(|e| {
-                        error!("Failed to download video: {}", e);
-                        Error {
-                            code: jsonrpc_core::ErrorCode::InternalError,
-                            message: "Download Error".to_string(),
-                            data: Some(format!("Download Error: {}", e).into()),
-                        }
+                        error!("Download error: {}", e);
+                        Error { code: jsonrpc_core::ErrorCode::InternalError, message: e.clone(), data: Some(e.into()) }
                     })?;
 
                 let path_str = tempfile.path().to_str().unwrap().to_owned();
-                debug!("Temporary video file path: {}", path_str);
-
                 let dimensions = task::spawn_blocking(move || probe_video_dimensions(&path_str))
                     .await
                     .map_err(|e| {
-                        error!("Join Error: {:?}", e);
-                        Error {
-                            code: jsonrpc_core::ErrorCode::InternalError,
-                            message: "Join Error".to_string(),
-                            data: Some(format!("Join Error: {:?}", e).into()),
-                        }
+                        error!("Join error: {:?}", e);
+                        Error { code: jsonrpc_core::ErrorCode::InternalError, message: format!("Join Error: {:?}", e), data: None }
                     })?
                     .map_err(|e| {
-                        error!("Probe Error: {}", e);
-                        Error {
-                            code: jsonrpc_core::ErrorCode::InternalError,
-                            message: "Probe Error".to_string(),
-                            data: Some(format!("Probe Error: {}", e).into()),
-                        }
+                        error!("Probing error: {}", e);
+                        Error { code: jsonrpc_core::ErrorCode::InternalError, message: e.clone(), data: Some(e.into()) }
                     })?;
 
-                debug!("Dimensions probed successfully: {:?}", dimensions);
+                if tx.send((parsed.clone(), dimensions)).await.is_err() {
+                    error!("Failed to queue database insert");
+                }
 
-                let request_date = chrono::DateTime::parse_from_rfc3339(&parsed.date)
-                    .map_err(|e| {
-                        error!("Invalid date format: {}", e);
-                        jsonrpc_core::Error {
-                            code: jsonrpc_core::ErrorCode::InvalidParams,
-                            message: "Invalid date format".to_string(),
-                            data: Some(format!("Date parse error: {}", e).into()),
-                        }
-                    })?
-                    .naive_utc();
+                info!("Returning dimensions: width={}, height={}", dimensions.0, dimensions.1);
 
-                info!("Inserting request data into database...");
-                debug!(
-                "Insert parameters: identifier={}, file_name={}, request_date={}, width={}, height={}",
-                parsed.identifier, parsed.file_name, request_date, dimensions.0, dimensions.1
-                );
-
-                sqlx::query!(
-                        "INSERT INTO video_requests (
-                            identifier, file_name, request_date, width, height
-                            ) VALUES ($1, $2, $3, $4, $5)",
-                        parsed.identifier,
-                        parsed.file_name,
-                        request_date,
-                        dimensions.0 as i32,
-                        dimensions.1 as i32
-                    )
-                    .execute(&db_pool)
-                    .await
-                    .map_err(|e| jsonrpc_core::Error {
-                        code: jsonrpc_core::ErrorCode::InternalError,
-                        message: "Database Insert Error".to_string(),
-                        data: Some(format!("Database error: {:?}", e).into())
-                    })?;
-
-                info!("Request handled successfully.");
-
-                Ok(serde_json::to_value(VideoDimensions {
-                    width: dimensions.0,
-                    height: dimensions.1,
-                }).unwrap())
+                Ok(serde_json::to_value(VideoDimensions { width: dimensions.0, height: dimensions.1 }).unwrap())
             }
         });
     }
