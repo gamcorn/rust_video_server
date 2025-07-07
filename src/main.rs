@@ -1,19 +1,16 @@
 use serde::{Deserialize, Serialize};
 use jsonrpc_core::{IoHandler, Params, Error};
 use jsonrpc_http_server::ServerBuilder;
-use once_cell::sync::Lazy;
 use reqwest::Client;
-use tempfile::NamedTempFile;
-use std::io::Write;
 use serde_yaml;
 use sqlx::postgres::PgPoolOptions;
-use tokio::{task, sync::mpsc};
+use tokio::{sync::mpsc};
 use chrono;
 use tracing::{info, error, debug, Level};
 use tracing_subscriber::FmtSubscriber;
-use std::process::Command;
+use std::convert::TryInto;
+use std::error;
 
-static CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
 #[derive(Debug, Deserialize)]
 struct DatabaseConfig {
@@ -58,62 +55,32 @@ async fn load_config(path: &str) -> Result<Settings, Box<dyn std::error::Error>>
     Ok(config)
 }
 
-async fn download_video_to_tempfile(url: &str) -> Result<NamedTempFile, String> {
-    info!("Downloading video from URL: {}", url);
-    let response = CLIENT.get(url).send().await.map_err(|e| {
-        error!("HTTP request failed: {}", e);
-        format!("HTTP request error: {}", e)
-    })?;
-
-    if !response.status().is_success() {
-        error!("Failed to download video: HTTP {}", response.status());
-        return Err(format!("Failed to download video: HTTP {}", response.status()));
-    }
-
-    let bytes = response.bytes().await.map_err(|e| {
-        error!("Failed to read response bytes: {}", e);
-        format!("Failed getting bytes: {}", e)
-    })?;
-
-    let mut tempfile = NamedTempFile::new().map_err(|e| {
-        error!("Failed to create temp file: {}", e);
-        format!("Tempfile error: {}", e)
-    })?;
-
-    tempfile.write_all(&bytes).map_err(|e| {
-        error!("Failed writing to temp file: {}", e);
-        format!("Failed writing content: {}", e)
-    })?;
-
-    info!("Video downloaded to temporary file");
-    Ok(tempfile)
+async fn fetch_partial_video_data(url: &str, range: &str) -> Result<Vec<u8>, Box<dyn error::Error>> {
+    let client = Client::new();
+    let response = client.get(url)
+        .header("Range", range)
+        .send()
+        .await?;
+    let bytes = response.bytes().await?;
+    Ok(bytes.to_vec())
 }
 
-fn probe_video_dimensions(file_path: &str) -> Result<(u32, u32), String> {
-    debug!("Probing video dimensions for file: {}", file_path);
-
-    let output = Command::new("mediainfo")
-        .arg("--Inform=Video;%Width%x%Height%")
-        .arg(file_path)
-        .output()
-        .map_err(|e| format!("Failed to execute mediainfo: {}", e))?;
-
-    if !output.status.success() {
-        return Err("mediainfo command failed".to_string());
+fn get_video_dimensions_avi(data: &[u8]) -> Result<(u32, u32), Box<dyn error::Error>> {
+    let needle = b"avih";
+    if let Some(pos) = data.windows(4).position(|window| window == needle) {
+        if data.len() < pos + 8 + 40 {
+            return Err("Not enough data after avih header".into());
+        }
+        let header_start = pos + 8;
+        let width = u32::from_le_bytes(data[header_start + 32..header_start + 36].try_into()?);
+        let height = u32::from_le_bytes(data[header_start + 36..header_start + 40].try_into()?);
+        if width == 0 || height == 0 {
+            return Err("Invalid dimensions found in AVI header".into());
+        }
+        Ok((width, height))
+    } else {
+        Err("AVI header (avih) not found in data".into())
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let dims: Vec<&str> = stdout.trim().split('x').collect();
-
-    if dims.len() != 2 {
-        return Err("Unexpected mediainfo output".to_string());
-    }
-
-    let width = dims[0].parse::<u32>().map_err(|_| "Failed to parse width".to_string())?;
-    let height = dims[1].parse::<u32>().map_err(|_| "Failed to parse height".to_string())?;
-
-    debug!("Parsed dimensions: width={}, height={}", width, height);
-    Ok((width, height))
 }
 
 fn parse_log_level(level: &str) -> Level {
@@ -174,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let tx = tx.clone();
         io.add_method("getVideoDimensions", move |params: Params| {
+            let db_pool = db_pool.clone();
             let tx = tx.clone();
             async move {
                 info!("Received getVideoDimensions request");
@@ -183,31 +151,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Error::invalid_params(format!("Invalid params: {}", e))
                     })?;
 
-                let tempfile = download_video_to_tempfile(&parsed.url).await
-                    .map_err(|e| {
-                        error!("Download error: {}", e);
-                        Error { code: jsonrpc_core::ErrorCode::InternalError, message: e.clone(), data: Some(e.into()) }
-                    })?;
-
-                let path_str = tempfile.path().to_str().unwrap().to_owned();
-                let dimensions = task::spawn_blocking(move || probe_video_dimensions(&path_str))
+                if let Some(record) = sqlx::query!(
+                "SELECT width, height FROM video_requests WHERE file_name = $1 LIMIT 1",
+                parsed.file_name
+            )
+                    .fetch_optional(&db_pool)
                     .await
                     .map_err(|e| {
-                        error!("Join error: {:?}", e);
-                        Error { code: jsonrpc_core::ErrorCode::InternalError, message: format!("Join Error: {:?}", e), data: None }
-                    })?
+                        error!("Getting record from DB failed with error: {}", e);
+                        Error::internal_error()
+                    })? {
+                    info!("Cache hit for file: {}", parsed.file_name);
+                    return Ok(serde_json::to_value(VideoDimensions {
+                        width: record.width as u32,
+                        height: record.height as u32,
+                    })
+                        .unwrap());
+                }
+
+
+                let data = fetch_partial_video_data(&parsed.url, "bytes=0-8191")
+                    .await
                     .map_err(|e| {
-                        error!("Probing error: {}", e);
-                        Error { code: jsonrpc_core::ErrorCode::InternalError, message: e.clone(), data: Some(e.into()) }
+                        error!("Fetching video failed with error: {}", e);
+                        Error::internal_error()
+                    })?;
+                let dimensions = get_video_dimensions_avi(&data)
+                    .map_err(|e| {
+                        error!("Getting video dimensions failed with error: {}", e);
+                        Error::internal_error()
                     })?;
 
+                // Send to background task for DB insertion.
                 if tx.send((parsed.clone(), dimensions)).await.is_err() {
                     error!("Failed to queue database insert");
                 }
 
                 info!("Returning dimensions: width={}, height={}", dimensions.0, dimensions.1);
-
-                Ok(serde_json::to_value(VideoDimensions { width: dimensions.0, height: dimensions.1 }).unwrap())
+                Ok(serde_json::to_value(VideoDimensions {
+                    width: dimensions.0,
+                    height: dimensions.1,
+                })
+                    .unwrap())
             }
         });
     }
