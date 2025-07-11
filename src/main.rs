@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use jsonrpc_core::{IoHandler, Params, Error};
+use jsonrpc_core::{Params, Error};
 use jsonrpc_http_server::ServerBuilder;
 use reqwest::Client;
 use serde_yaml;
@@ -9,8 +9,9 @@ use chrono;
 use tracing::{info, error, debug, Level};
 use tracing_subscriber::FmtSubscriber;
 use std::convert::TryInto;
-use std::error;
-
+use std::sync::Arc;
+use chrono::TimeZone;
+use memchr::memmem;
 
 #[derive(Debug, Deserialize)]
 struct DatabaseConfig {
@@ -55,8 +56,7 @@ async fn load_config(path: &str) -> Result<Settings, Box<dyn std::error::Error>>
     Ok(config)
 }
 
-async fn fetch_partial_video_data(url: &str, range: &str) -> Result<Vec<u8>, Box<dyn error::Error>> {
-    let client = Client::new();
+async fn fetch_partial_video_data(client: &Client, url: &str, range: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let response = client.get(url)
         .header("Range", range)
         .send()
@@ -65,9 +65,9 @@ async fn fetch_partial_video_data(url: &str, range: &str) -> Result<Vec<u8>, Box
     Ok(bytes.to_vec())
 }
 
-fn get_video_dimensions_avi(data: &[u8]) -> Result<(u32, u32), Box<dyn error::Error>> {
+fn get_video_dimensions_avi(data: &[u8]) -> Result<(u32, u32), Box<dyn std::error::Error>> {
     let needle = b"avih";
-    if let Some(pos) = data.windows(4).position(|window| window == needle) {
+    if let Some(pos) = memmem::find(data, needle) {
         if data.len() < pos + 8 + 40 {
             return Err("Not enough data after avih header".into());
         }
@@ -114,13 +114,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (tx, mut rx) = mpsc::channel::<(VideoRequest, (u32, u32))>(100);
 
-    let db_pool_clone = db_pool.clone();
+    let db_pool_clone = Arc::new(db_pool.clone());
+    let tx = Arc::new(tx.clone());
     tokio::spawn(async move {
         while let Some((parsed, dimensions)) = rx.recv().await {
             let request_date = chrono::DateTime::parse_from_rfc3339(&parsed.date)
                 .map(|dt| dt.naive_utc())
-                .unwrap_or_else(|_| chrono::NaiveDateTime::from_timestamp(0, 0));
-
+                .unwrap_or_else(|_| chrono::Utc.timestamp_opt(0, 0).single().unwrap().naive_utc());
             if let Err(e) = sqlx::query!(
                 "INSERT INTO video_requests (identifier, file_name, request_date, width, height) VALUES ($1, $2, $3, $4, $5)",
                 parsed.identifier,
@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 request_date,
                 dimensions.0 as i32,
                 dimensions.1 as i32
-            ).execute(&db_pool_clone).await {
+            ).execute(&*db_pool_clone).await {
                 error!("Database insert failed: {:?}", e);
             } else {
                 debug!("Database insert successful for identifier: {}", parsed.identifier);
@@ -136,46 +136,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut io = IoHandler::new();
+    let client = Client::builder().build()?;
+    let mut io = jsonrpc_core::IoHandler::new();
 
-    {
-        let tx = tx.clone();
-        io.add_method("getVideoDimensions", move |params: Params| {
-            let db_pool = db_pool.clone();
-            let tx = tx.clone();
-            async move {
-                info!("Received getVideoDimensions request");
-                let parsed: VideoRequest = params.parse()
-                    .map_err(|e| {
+    // let db_pool_for_method = Arc::new(db_pool.clone());
+    let tx_for_method = Arc::new(tx.clone());
+
+    io.add_method("getVideoDimensions", {
+    // let db_pool = Arc::clone(&db_pool_for_method);
+    let tx = Arc::clone(&tx_for_method);
+
+    move |params: Params| {
+            // let db_pool = Arc::clone(&db_pool);
+            let tx = Arc::clone(&tx);
+            let client = client.clone();
+            Box::pin(async move {
+            info!("Received getVideoDimensions request");
+            let parsed: VideoRequest = params.parse().map_err(|e| {
                         error!("Invalid request params: {}", e);
                         Error::invalid_params(format!("Invalid params: {}", e))
                     })?;
 
-                if let Some(record) = sqlx::query!(
-                "SELECT width, height FROM video_requests WHERE file_name = $1 LIMIT 1",
-                parsed.file_name
-            )
-                    .fetch_optional(&db_pool)
-                    .await
-                    .map_err(|e| {
-                        error!("Getting record from DB failed with error: {}", e);
-                        Error::internal_error()
-                    })? {
-                    info!("Cache hit for file: {}", parsed.file_name);
-                    return Ok(serde_json::to_value(VideoDimensions {
-                        width: record.width as u32,
-                        height: record.height as u32,
-                    })
-                        .unwrap());
-                }
+                // if let Some(record) = sqlx::query!(
+                // "SELECT width, height FROM video_requests WHERE file_name = $1 LIMIT 1",
+                // parsed.file_name
+                //     )
+                //     .fetch_optional(&*db_pool)
+                //     .await
+                //     .map_err(|e| {
+                //         error!("Getting record from DB failed with error: {}", e);
+                //         Error::internal_error()
+                //     })? {
+                //     info!("Cache hit for file: {}", parsed.file_name);
+                //     return Ok(serde_json::to_value(VideoDimensions {
+                //         width: record.width as u32,
+                //         height: record.height as u32,
+                //     })
+                //         .unwrap());
+                // }
 
-
-                let data = fetch_partial_video_data(&parsed.url, "bytes=0-8191")
+                let data = fetch_partial_video_data(&client, &parsed.url, "bytes=0-8191")
                     .await
                     .map_err(|e| {
                         error!("Fetching video failed with error: {}", e);
                         Error::internal_error()
                     })?;
+
                 let dimensions = get_video_dimensions_avi(&data)
                     .map_err(|e| {
                         error!("Getting video dimensions failed with error: {}", e);
@@ -191,11 +197,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(serde_json::to_value(VideoDimensions {
                     width: dimensions.0,
                     height: dimensions.1,
-                })
-                    .unwrap())
-            }
-        });
-    }
+                }).unwrap())
+            })
+        }
+    });
 
     info!("Starting RPC server at http://0.0.0.0:3030");
     let server = ServerBuilder::new(io)
