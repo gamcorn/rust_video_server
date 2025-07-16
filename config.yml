@@ -1,8 +1,8 @@
 database:
   url: "localhost"
-  user: "db"
-  password: "secret"
-  dbname: "video"
+  user: "amc"
+  password: "amc"
+  dbname: "video_server"
 app_conf:
   log_level: "ERROR"
   num_threads: 2
